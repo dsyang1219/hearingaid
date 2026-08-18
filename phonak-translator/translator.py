@@ -45,6 +45,7 @@ import wave
 from collections import deque
 from datetime import datetime, timezone
 
+import numpy as np
 import sounddevice as sd
 import webrtcvad
 
@@ -101,6 +102,47 @@ def pcm_to_wav_buffer(pcm: bytes, rate: int = SAMPLE_RATE) -> io.BytesIO:
     buf.seek(0)
     buf.name = "utterance.wav"  # the SDK infers format from the filename
     return buf
+
+
+def _device_output_rate(device):
+    try:
+        return int(round(sd.query_devices(device, "output")["default_samplerate"]))
+    except Exception:
+        return None
+
+
+def _device_output_channels(device):
+    try:
+        return max(1, int(sd.query_devices(device, "output")["max_output_channels"]))
+    except Exception:
+        return 1
+
+
+class _StreamResampler:
+    """Linear-interpolation resampler that keeps phase continuous across
+    chunks, so streamed PCM doesn't click/warble at chunk boundaries."""
+
+    def __init__(self, orig_rate: int, target_rate: int):
+        self.step = orig_rate / target_rate  # source samples per output sample
+        self.pos = 0.0                        # fractional read position, in source samples
+        self.buffer = np.array([], dtype=np.float32)
+
+    def process(self, pcm: bytes) -> bytes:
+        new_samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        self.buffer = np.concatenate([self.buffer, new_samples])
+        out = []
+        while self.pos + 1 < len(self.buffer):
+            i0 = int(self.pos)
+            frac = self.pos - i0
+            out.append(self.buffer[i0] * (1 - frac) + self.buffer[i0 + 1] * frac)
+            self.pos += self.step
+        consumed = int(self.pos)
+        if consumed:
+            self.buffer = self.buffer[consumed:]
+            self.pos -= consumed
+        if not out:
+            return b""
+        return np.clip(np.array(out, dtype=np.float32), -32768, 32767).astype(np.int16).tobytes()
 
 
 def list_devices():
@@ -236,11 +278,13 @@ class Speaker:
     whole clip is synthesised, and raw PCM skips a decode step entirely.
     """
 
-    def __init__(self, client: OpenAI, device, model=TTS_MODEL, voice=TTS_VOICE):
+    def __init__(self, client: OpenAI, device, model=TTS_MODEL, voice=TTS_VOICE,
+                 timing=False):
         self.client = client
         self.device = device
         self.model = model
         self.voice = voice
+        self.timing = timing
         self.playing = threading.Event()
         self.cancel = threading.Event()
 
@@ -250,14 +294,32 @@ class Speaker:
         if mic is not None:
             mic.muted.set()
         try:
-            stream = sd.RawOutputStream(
-                samplerate=TTS_RATE, channels=1, dtype="int16", device=self.device,
-            )
+            try:
+                stream = sd.RawOutputStream(
+                    samplerate=TTS_RATE, channels=1, dtype="int16", device=self.device,
+                )
+                stream_rate, stream_channels = TTS_RATE, 1
+            except sd.PortAudioError:
+                # Some WASAPI endpoints reject the stream outright if the rate
+                # isn't one they advertise, instead of resampling for us --
+                # fall back to the device's own rate/channel count and adapt
+                # the PCM ourselves (mono source, so just duplicate channels).
+                stream_rate = _device_output_rate(self.device) or TTS_RATE
+                stream_channels = _device_output_channels(self.device)
+                stream = sd.RawOutputStream(
+                    samplerate=stream_rate, channels=stream_channels, dtype="int16",
+                    device=self.device,
+                )
+            resampler = _StreamResampler(TTS_RATE, stream_rate) if stream_rate != TTS_RATE else None
+            t_speak0 = time.monotonic()
             with stream:
                 with self.client.audio.speech.with_streaming_response.create(
                     model=self.model, voice=self.voice, input=text,
                     response_format="pcm",
                 ) as response:
+                    if self.timing:
+                        print(f"  [timing] tts-first-byte={time.monotonic()-t_speak0:.2f}s",
+                              file=sys.stderr)
                     leftover = b""
                     for chunk in response.iter_bytes(4096):
                         if self.cancel.is_set():
@@ -266,7 +328,14 @@ class Speaker:
                         whole = len(data) - (len(data) % 2)  # keep samples intact
                         leftover = data[whole:]
                         if whole:
-                            stream.write(data[:whole])
+                            pcm = data[:whole]
+                            if resampler is not None:
+                                pcm = resampler.process(pcm)
+                            if pcm and stream_channels > 1:
+                                mono = np.frombuffer(pcm, dtype=np.int16)
+                                pcm = np.repeat(mono, stream_channels).tobytes()
+                            if pcm:
+                                stream.write(pcm)
                 if self.cancel.is_set():
                     stream.abort()
                 else:
@@ -333,8 +402,9 @@ class Worker:
 
 
 def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
-                 log: "TranscriptLog | None"):
+                 log: "TranscriptLog | None", timing: bool = False):
     def handle(pcm: bytes):
+        t0 = time.monotonic()
         try:
             heard = engine.transcribe(pcm_to_wav_buffer(pcm))
         except Exception as exc:
@@ -343,6 +413,7 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
         if not heard:
             return
         print(f"  heard: {heard}")
+        t1 = time.monotonic()
 
         try:
             text = engine.translate(heard)
@@ -352,6 +423,7 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
         if not text:
             return
         print(f"  ↪ {text}")
+        t2 = time.monotonic()
 
         if log is not None:
             log.write(heard, text)
@@ -359,6 +431,10 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
             speaker.speak(text, mic)
         except Exception as exc:
             print(f"[tts error] {exc}", file=sys.stderr)
+        if timing:
+            t3 = time.monotonic()
+            print(f"  [timing] stt={t1-t0:.2f}s translate={t2-t1:.2f}s "
+                  f"speak={t3-t2:.2f}s total={t3-t0:.2f}s", file=sys.stderr)
 
     return handle
 
@@ -514,6 +590,8 @@ def build_parser():
     ap.add_argument("--tts-model", default=TTS_MODEL, help="text-to-speech model")
     ap.add_argument("--voice", default=TTS_VOICE,
                     help="alloy, echo, fable, onyx, nova, shimmer")
+    ap.add_argument("--timing", action="store_true",
+                    help="print a per-stage latency breakdown to stderr")
     return ap
 
 
@@ -534,11 +612,11 @@ def main():
 
     engine = Translator(client, args.target, args.source, args.stt_model,
                         args.llm_model, args.vocab, args.context)
-    speaker = Speaker(client, output_device, args.tts_model, args.voice)
+    speaker = Speaker(client, output_device, args.tts_model, args.voice, args.timing)
     log = TranscriptLog(args.log) if args.log else None
 
     with Microphone(input_device) as mic:
-        worker = Worker(make_handler(engine, speaker, mic, log))
+        worker = Worker(make_handler(engine, speaker, mic, log, args.timing))
         try:
             if args.ptt:
                 run_ptt(mic, worker, speaker, args)
