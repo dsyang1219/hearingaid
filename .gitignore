@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Secrets -- never commit an API key
+.env
+.env.*
+
+# Session transcripts written by --log
+*.jsonl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
