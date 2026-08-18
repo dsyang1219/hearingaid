@@ -293,10 +293,37 @@ class Speaker:
         self.playing.set()
         if mic is not None:
             mic.muted.set()
+
+        # PortAudio's WASAPI backend only reliably supports its callback-driven
+        # mode on some devices -- the blocking write() API used here previously
+        # is an emulated fallback that both crashes on some endpoints and gives
+        # no underrun protection (silence-pads instead of glitching) on others.
+        # A background thread fills this buffer from the network; the audio
+        # callback drains it on PortAudio's own schedule.
+        buf = bytearray()
+        buf_lock = threading.Lock()
+        source_done = threading.Event()
+        playback_done = threading.Event()
+
+        def callback(outdata, _frames, _time_info, _status):
+            needed = len(outdata)
+            with buf_lock:
+                chunk = bytes(buf[:needed])
+                del buf[:needed]
+            if len(chunk) < needed:
+                chunk += b"\x00" * (needed - len(chunk))
+                outdata[:] = chunk
+                if source_done.is_set() or self.cancel.is_set():
+                    playback_done.set()
+                    raise sd.CallbackStop
+            else:
+                outdata[:] = chunk
+
         try:
             try:
                 stream = sd.RawOutputStream(
                     samplerate=TTS_RATE, channels=1, dtype="int16", device=self.device,
+                    callback=callback,
                 )
                 stream_rate, stream_channels = TTS_RATE, 1
             except sd.PortAudioError:
@@ -308,7 +335,7 @@ class Speaker:
                 stream_channels = _device_output_channels(self.device)
                 stream = sd.RawOutputStream(
                     samplerate=stream_rate, channels=stream_channels, dtype="int16",
-                    device=self.device,
+                    device=self.device, callback=callback,
                 )
             resampler = _StreamResampler(TTS_RATE, stream_rate) if stream_rate != TTS_RATE else None
             t_speak0 = time.monotonic()
@@ -335,11 +362,16 @@ class Speaker:
                                 mono = np.frombuffer(pcm, dtype=np.int16)
                                 pcm = np.repeat(mono, stream_channels).tobytes()
                             if pcm:
-                                stream.write(pcm)
+                                with buf_lock:
+                                    buf.extend(pcm)
                 if self.cancel.is_set():
                     stream.abort()
                 else:
-                    time.sleep(float(stream.latency) + 0.15)  # let the tail drain
+                    source_done.set()
+                    while not playback_done.is_set() and not self.cancel.is_set():
+                        time.sleep(0.02)
+                    if self.cancel.is_set() and not playback_done.is_set():
+                        stream.abort()
         finally:
             self.playing.clear()
             if mic is not None:
