@@ -65,7 +65,7 @@ SOURCE_LANG = None          # ISO code being spoken; None = auto-detect
 SAMPLE_RATE = 16000         # webrtcvad requires 8k/16k/32k/48k; 16k is ideal
 FRAME_MS = 30               # VAD frame size (10, 20, or 30 ms)
 VAD_AGGRESSIVENESS = 2      # 0 (permissive) .. 3 (aggressive noise filtering)
-SILENCE_TAIL_MS = 400       # trailing silence that ends an utterance
+SILENCE_TAIL_MS = 700       # trailing silence that ends an utterance
 MIN_UTTERANCE_MS = 400      # ignore blips shorter than this
 MAX_UTTERANCE_MS = 15000    # hard cap so one long talker still gets flushed
 
