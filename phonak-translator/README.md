@@ -104,7 +104,8 @@ your aid and see the text in the terminal.
 | `--ptt` / `--key` | Push-to-talk, and which key to hold. |
 | `--log` | Append a JSONL transcript of everything heard and said. |
 | `--vad-aggressiveness` | 0–3; raise it in noisy rooms (VAD mode). |
-| `--silence-ms` | Pause length that ends an utterance. Lower = snappier, more fragments. |
+| `--silence-ms` | Pause length that ends an utterance. Lower = snappier, but risks clipping the end of a sentence -- 700ms (default) was the shortest value that held up in testing; 400-625ms clipped mid-sentence pauses. |
+| `--eager-ms` | Shorter pause (VAD mode) that starts speculative transcribe+translate in the background while still listening, so if the guess is confirmed right the translate round trip happens *during* the `--silence-ms` wait instead of after it. `0` disables it. |
 | `--stt-model` | Speech-to-text model. `whisper-large-v3-turbo` (default) or `whisper-large-v3` for higher accuracy. |
 | `--llm-model` / `--tts-model` / `--voice` | Model and voice selection (voices: `autumn`, `diana`, `hannah`, `austin`, `daniel`, `troy`). |
 | `--timing` | Print a per-stage latency breakdown (STT/translate/TTS) to stderr. |

@@ -66,6 +66,12 @@ SAMPLE_RATE = 16000         # webrtcvad requires 8k/16k/32k/48k; 16k is ideal
 FRAME_MS = 30               # VAD frame size (10, 20, or 30 ms)
 VAD_AGGRESSIVENESS = 2      # 0 (permissive) .. 3 (aggressive noise filtering)
 SILENCE_TAIL_MS = 700       # trailing silence that ends an utterance
+EAGER_SILENCE_MS = 350      # shorter pause that starts speculative processing
+                            # (VAD mode only) -- if speech resumes before
+                            # SILENCE_TAIL_MS, the guess is discarded and
+                            # retried at the next pause; if not, its result is
+                            # used immediately instead of starting from
+                            # scratch, hiding most of the silence-tail wait
 MIN_UTTERANCE_MS = 400      # ignore blips shorter than this
 MAX_UTTERANCE_MS = 15000    # hard cap so one long talker still gets flushed
 
@@ -260,7 +266,10 @@ class Translator:
         self.llm_model = llm_model
         self.vocab = vocab
         # Alternating user/assistant messages: two entries per exchange.
+        # Guarded by a lock -- speculative (eager) processing reads this from
+        # a background thread while the Worker thread may be committing to it.
         self.history = deque(maxlen=max(0, context_turns) * 2)
+        self._history_lock = threading.Lock()
 
     def transcribe(self, wav_buf) -> str:
         """Speech -> text in whatever language was spoken."""
@@ -274,11 +283,19 @@ class Translator:
             kwargs["prompt"] = self.vocab
         return self.client.audio.transcriptions.create(**kwargs).text.strip()
 
-    def translate(self, text: str) -> str:
-        """Text -> text in the target language, using recent turns as context."""
+    def translate(self, text: str, commit_history: bool = True) -> str:
+        """Text -> text in the target language, using recent turns as context.
+
+        `commit_history=False` is for speculative (eager) translation of an
+        utterance that might not actually be finished yet -- it must not
+        pollute the conversation history with a guess that could turn out
+        wrong or incomplete. Call `commit(text, out)` afterward if the guess
+        is later confirmed correct.
+        """
         messages = [{"role": "system",
                      "content": SYSTEM_PROMPT.format(target=self.target)}]
-        messages.extend(self.history)
+        with self._history_lock:
+            messages.extend(self.history)
         messages.append({"role": "user", "content": text})
 
         chat = self.client.chat.completions.create(
@@ -286,10 +303,16 @@ class Translator:
         )
         out = (chat.choices[0].message.content or "").strip()
 
-        if self.history.maxlen:
-            self.history.append({"role": "user", "content": text})
-            self.history.append({"role": "assistant", "content": out})
+        if commit_history:
+            self.commit(text, out)
         return out
+
+    def commit(self, heard: str, translated: str) -> None:
+        """Record a confirmed exchange in the conversation history."""
+        if self.history.maxlen:
+            with self._history_lock:
+                self.history.append({"role": "user", "content": heard})
+                self.history.append({"role": "assistant", "content": translated})
 
 
 class Speaker:
@@ -452,8 +475,16 @@ class Worker:
 
 def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
                  log: "TranscriptLog | None", timing: bool = False):
-    def handle(pcm: bytes):
+    def handle(item):
+        pcm, cached = item if isinstance(item, tuple) else (item, None)
         t0 = time.monotonic()
+
+        # Always re-transcribe the complete final buffer, even if a
+        # speculative guess is available: webrtcvad can misclassify quiet
+        # trailing words as silence, so a snapshot taken before the true end
+        # of speech can be missing content the final buffer actually has.
+        # Only the (safe to skip) translate step gets reused, and only if
+        # the fresh transcript exactly matches what the guess was based on.
         try:
             heard = engine.transcribe(pcm_to_wav_buffer(pcm))
         except Exception as exc:
@@ -464,11 +495,15 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
         print(f"  heard: {heard}")
         t1 = time.monotonic()
 
-        try:
-            text = engine.translate(heard)
-        except Exception as exc:
-            print(f"[translate error] {exc}", file=sys.stderr)
-            return
+        if cached is not None and cached.get("heard") == heard:
+            text = cached["text"]
+            engine.commit(heard, text)
+        else:
+            try:
+                text = engine.translate(heard)
+            except Exception as exc:
+                print(f"[translate error] {exc}", file=sys.stderr)
+                return
         if not text:
             return
         print(f"  ↪ {text}")
@@ -491,10 +526,12 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
 # ----------------------------------------------------------------------------
 # Capture modes
 # ----------------------------------------------------------------------------
-def run_vad(mic: Microphone, worker: Worker, args):
+def run_vad(mic: Microphone, worker: Worker, engine: Translator, args):
     vad = webrtcvad.Vad(args.vad_aggressiveness)
 
     silence_tail_frames = args.silence_ms // FRAME_MS
+    # 0 disables speculative processing; None here means "never fires".
+    eager_silence_frames = max(1, args.eager_ms // FRAME_MS) if args.eager_ms > 0 else None
     min_frames = MIN_UTTERANCE_MS // FRAME_MS
     max_frames = MAX_UTTERANCE_MS // FRAME_MS
 
@@ -503,6 +540,33 @@ def run_vad(mic: Microphone, worker: Worker, args):
 
     mic.enabled.set()
     buffered, trailing_silence, speaking = [], 0, False
+
+    # Speculative processing: at a short pause (eager_silence_frames), guess
+    # that the utterance is done and start transcribing/translating it in
+    # the background while still listening. The final buffer always gets
+    # re-transcribed regardless (see make_handler -- webrtcvad can miss quiet
+    # trailing words, so an early snapshot can't be trusted as complete), but
+    # if the fresh transcript matches the guess, the translate round trip is
+    # skipped and happens *during* the silence-tail wait instead of after it.
+    # commit_history=False keeps a guess from polluting conversation context
+    # until it's confirmed correct (in make_handler).
+    eager_pending = False
+    speculative: dict = {}
+    speculative_lock = threading.Lock()
+
+    def run_speculative(pcm_snapshot: bytes):
+        try:
+            heard = engine.transcribe(pcm_to_wav_buffer(pcm_snapshot))
+            if not heard or _is_hallucination(heard):
+                return
+            text = engine.translate(heard, commit_history=False)
+            if not text:
+                return
+            with speculative_lock:
+                speculative["heard"] = heard
+                speculative["text"] = text
+        except Exception:
+            pass  # the final pass will just redo the work from scratch
 
     while True:
         frame = mic.frames.get()
@@ -515,17 +579,33 @@ def run_vad(mic: Microphone, worker: Worker, args):
             speaking = True
             buffered.append(frame)
             trailing_silence = 0
+            if eager_pending:
+                # More was said since the guess was taken -- it's stale.
+                eager_pending = False
+                with speculative_lock:
+                    speculative.clear()
         elif speaking:
             buffered.append(frame)
             trailing_silence += 1
+
+        if speaking and not eager_pending and trailing_silence == eager_silence_frames:
+            eager_pending = True
+            snapshot = b"".join(buffered)
+            threading.Thread(target=run_speculative, args=(snapshot,),
+                             daemon=True).start()
 
         end_of_utterance = speaking and trailing_silence >= silence_tail_frames
         over_length = speaking and len(buffered) >= max_frames
 
         if end_of_utterance or over_length:
             if len(buffered) >= min_frames:
-                worker.submit(b"".join(buffered))
-            buffered, speaking, trailing_silence = [], False, 0
+                with speculative_lock:
+                    cached = (dict(speculative)
+                             if eager_pending and "text" in speculative else None)
+                worker.submit((b"".join(buffered), cached))
+            buffered, speaking, trailing_silence, eager_pending = [], False, 0, False
+            with speculative_lock:
+                speculative.clear()
 
 
 def resolve_key(name: str):
@@ -632,6 +712,9 @@ def build_parser():
                     help="0-3; higher rejects more background noise (VAD mode)")
     ap.add_argument("--silence-ms", type=int, default=SILENCE_TAIL_MS,
                     help="pause that ends an utterance (VAD mode)")
+    ap.add_argument("--eager-ms", type=int, default=EAGER_SILENCE_MS,
+                    help="shorter pause that starts speculative processing "
+                         "in the background (VAD mode); 0 disables it")
     ap.add_argument("--stt-model", default=STT_MODEL,
                     help="speech-to-text model")
     ap.add_argument("--llm-model", default=LLM_MODEL,
@@ -671,7 +754,7 @@ def main():
             if args.ptt:
                 run_ptt(mic, worker, speaker, args)
             else:
-                run_vad(mic, worker, args)
+                run_vad(mic, worker, engine, args)
         except KeyboardInterrupt:
             print("\nStopping…")
             speaker.cancel.set()  # Ctrl-C means now, not after this sentence
