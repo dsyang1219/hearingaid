@@ -30,7 +30,9 @@ Usage:
     python translator.py --ptt --key f8            # different hold-to-talk key
     python translator.py --log session.jsonl       # keep a transcript
 
-Requires: OPENAI_API_KEY in the environment.
+Requires: GROQ_API_KEY in the environment (free at console.groq.com). Uses
+open-source models -- Whisper (STT), an open LLM (translation), and Orpheus
+(TTS) -- hosted on Groq's OpenAI-compatible API.
 """
 
 import argparse
@@ -63,15 +65,15 @@ SOURCE_LANG = None          # ISO code being spoken; None = auto-detect
 SAMPLE_RATE = 16000         # webrtcvad requires 8k/16k/32k/48k; 16k is ideal
 FRAME_MS = 30               # VAD frame size (10, 20, or 30 ms)
 VAD_AGGRESSIVENESS = 2      # 0 (permissive) .. 3 (aggressive noise filtering)
-SILENCE_TAIL_MS = 700       # trailing silence that ends an utterance
+SILENCE_TAIL_MS = 400       # trailing silence that ends an utterance
 MIN_UTTERANCE_MS = 400      # ignore blips shorter than this
 MAX_UTTERANCE_MS = 15000    # hard cap so one long talker still gets flushed
 
-STT_MODEL = "whisper-1"     # try "gpt-4o-mini-transcribe" for lower latency
-LLM_MODEL = "gpt-4o-mini"   # does the translating
-TTS_MODEL = "tts-1"         # low-latency TTS
-TTS_VOICE = "alloy"         # alloy, echo, fable, onyx, nova, shimmer
-TTS_RATE = 24000            # OpenAI "pcm" output is 24 kHz mono 16-bit
+BASE_URL = "https://api.groq.com/openai/v1"
+STT_MODEL = "whisper-large-v3-turbo"  # or "whisper-large-v3" for higher accuracy
+LLM_MODEL = "openai/gpt-oss-120b"     # does the translating
+TTS_MODEL = "canopylabs/orpheus-v1-english"
+TTS_VOICE = "troy"          # autumn, diana, hannah, austin, daniel, troy
 CONTEXT_TURNS = 4           # prior exchanges given to the translator
 
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit mono
@@ -272,10 +274,13 @@ class Translator:
 
 
 class Speaker:
-    """Streaming text-to-speech straight into the output device.
+    """Text-to-speech into the output device.
 
-    Audio starts playing as soon as the first chunk lands rather than after the
-    whole clip is synthesised, and raw PCM skips a decode step entirely.
+    Groq's TTS endpoint only returns a complete WAV file per request (no
+    incremental PCM streaming like OpenAI's), so this fetches the whole clip,
+    decodes it, then hands it to a PortAudio callback for playback -- the same
+    ring-buffer/device-fallback approach as before, just filled once instead
+    of incrementally.
     """
 
     def __init__(self, client: OpenAI, device, model=TTS_MODEL, voice=TTS_VOICE,
@@ -294,12 +299,6 @@ class Speaker:
         if mic is not None:
             mic.muted.set()
 
-        # PortAudio's WASAPI backend only reliably supports its callback-driven
-        # mode on some devices -- the blocking write() API used here previously
-        # is an emulated fallback that both crashes on some endpoints and gives
-        # no underrun protection (silence-pads instead of glitching) on others.
-        # A background thread fills this buffer from the network; the audio
-        # callback drains it on PortAudio's own schedule.
         buf = bytearray()
         buf_lock = threading.Lock()
         source_done = threading.Event()
@@ -320,50 +319,49 @@ class Speaker:
                 outdata[:] = chunk
 
         try:
+            t_speak0 = time.monotonic()
+            resp = self.client.audio.speech.create(
+                model=self.model, voice=self.voice, input=text,
+                response_format="wav",
+            )
+            with wave.open(io.BytesIO(resp.read()), "rb") as wf:
+                source_rate = wf.getframerate()
+                pcm = wf.readframes(wf.getnframes())
+            if self.timing:
+                print(f"  [timing] tts-download={time.monotonic()-t_speak0:.2f}s",
+                      file=sys.stderr)
+
+            # Query the device's real channel count up front rather than only
+            # on a PortAudioError: a channel-count mismatch alone (without a
+            # samplerate mismatch) can open "successfully" and just play
+            # silence, since WASAPI's rejection is specifically rate-based.
+            device_channels = _device_output_channels(self.device)
             try:
                 stream = sd.RawOutputStream(
-                    samplerate=TTS_RATE, channels=1, dtype="int16", device=self.device,
-                    callback=callback,
+                    samplerate=source_rate, channels=device_channels, dtype="int16",
+                    device=self.device, callback=callback,
                 )
-                stream_rate, stream_channels = TTS_RATE, 1
+                stream_rate, stream_channels = source_rate, device_channels
             except sd.PortAudioError:
-                # Some WASAPI endpoints reject the stream outright if the rate
-                # isn't one they advertise, instead of resampling for us --
-                # fall back to the device's own rate/channel count and adapt
-                # the PCM ourselves (mono source, so just duplicate channels).
-                stream_rate = _device_output_rate(self.device) or TTS_RATE
-                stream_channels = _device_output_channels(self.device)
+                # Some WASAPI endpoints also reject the stream outright if the
+                # rate isn't one they advertise, instead of resampling for us --
+                # fall back to the device's own rate and adapt the PCM ourselves.
+                stream_rate = _device_output_rate(self.device) or source_rate
+                stream_channels = device_channels
                 stream = sd.RawOutputStream(
                     samplerate=stream_rate, channels=stream_channels, dtype="int16",
                     device=self.device, callback=callback,
                 )
-            resampler = _StreamResampler(TTS_RATE, stream_rate) if stream_rate != TTS_RATE else None
-            t_speak0 = time.monotonic()
+
+            if stream_rate != source_rate:
+                pcm = _StreamResampler(source_rate, stream_rate).process(pcm)
+            if stream_channels > 1:
+                mono = np.frombuffer(pcm, dtype=np.int16)
+                pcm = np.repeat(mono, stream_channels).tobytes()
+            with buf_lock:
+                buf.extend(pcm)
+
             with stream:
-                with self.client.audio.speech.with_streaming_response.create(
-                    model=self.model, voice=self.voice, input=text,
-                    response_format="pcm",
-                ) as response:
-                    if self.timing:
-                        print(f"  [timing] tts-first-byte={time.monotonic()-t_speak0:.2f}s",
-                              file=sys.stderr)
-                    leftover = b""
-                    for chunk in response.iter_bytes(4096):
-                        if self.cancel.is_set():
-                            break
-                        data = leftover + chunk
-                        whole = len(data) - (len(data) % 2)  # keep samples intact
-                        leftover = data[whole:]
-                        if whole:
-                            pcm = data[:whole]
-                            if resampler is not None:
-                                pcm = resampler.process(pcm)
-                            if pcm and stream_channels > 1:
-                                mono = np.frombuffer(pcm, dtype=np.int16)
-                                pcm = np.repeat(mono, stream_channels).tobytes()
-                            if pcm:
-                                with buf_lock:
-                                    buf.extend(pcm)
                 if self.cancel.is_set():
                     stream.abort()
                 else:
@@ -621,7 +619,7 @@ def build_parser():
                     help="translation model")
     ap.add_argument("--tts-model", default=TTS_MODEL, help="text-to-speech model")
     ap.add_argument("--voice", default=TTS_VOICE,
-                    help="alloy, echo, fable, onyx, nova, shimmer")
+                    help="autumn, diana, hannah, austin, daniel, troy")
     ap.add_argument("--timing", action="store_true",
                     help="print a per-stage latency breakdown to stderr")
     return ap
@@ -634,10 +632,11 @@ def main():
         list_devices()
         return
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        sys.exit("Set OPENAI_API_KEY in your environment first.")
-    client = OpenAI(api_key=api_key)
+        sys.exit("Set GROQ_API_KEY in your environment first "
+                  "(free at console.groq.com).")
+    client = OpenAI(api_key=api_key, base_url=BASE_URL)
 
     input_device = resolve_device(args.input, "input")
     output_device = resolve_device(args.output, "output")

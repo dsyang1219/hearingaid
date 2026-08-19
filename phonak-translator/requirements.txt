@@ -1,5 +1,5 @@
-openai>=1.30
+openai>=1.30         # used as an OpenAI-compatible client pointed at Groq's API
 sounddevice>=0.4.6
-numpy>=1.24         # only used to resample TTS audio if the output device rejects 24kHz
+numpy>=1.24         # only used to resample TTS audio if the output device rejects its native rate
 webrtcvad>=2.0.10  # on Windows, `pip install webrtcvad-wheels` avoids needing a C compiler
 pynput>=1.7        # only needed for --ptt (push-to-talk) mode

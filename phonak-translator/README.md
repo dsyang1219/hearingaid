@@ -7,12 +7,13 @@ Phonak is just the default speaker. Zero firmware hacking.
 
 ```
 mic → segmentation (VAD or push-to-talk) → speech-to-text
-    → LLM translate (with conversation context) → streaming TTS
+    → LLM translate (with conversation context) → TTS
     → default output (your Phonak)
 ```
 
-Default: **auto-detect any language → English**, cloud APIs for quality and low
-latency. One flag flips the direction.
+Default: **auto-detect any language → English**, using open-source models
+(Whisper, an open LLM, Orpheus TTS) hosted on [Groq](https://console.groq.com)
+for low-latency inference. One flag flips the direction.
 
 ## Setup
 
@@ -20,7 +21,7 @@ latency. One flag flips the direction.
 cd phonak-translator
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export OPENAI_API_KEY=sk-...        # required
+export GROQ_API_KEY=gsk_...        # required, free at console.groq.com
 ```
 
 <details>
@@ -31,7 +32,7 @@ cd phonak-translator
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-$env:OPENAI_API_KEY = "sk-..."
+$env:GROQ_API_KEY = "gsk_..."
 ```
 
 - Use Python **3.12** — the newest releases often have no prebuilt wheels yet.
@@ -104,22 +105,26 @@ your aid and see the text in the terminal.
 | `--log` | Append a JSONL transcript of everything heard and said. |
 | `--vad-aggressiveness` | 0–3; raise it in noisy rooms (VAD mode). |
 | `--silence-ms` | Pause length that ends an utterance. Lower = snappier, more fragments. |
-| `--stt-model` | Speech-to-text model. Try `gpt-4o-mini-transcribe` for lower latency. |
-| `--llm-model` / `--tts-model` / `--voice` | Model and voice selection. |
+| `--stt-model` | Speech-to-text model. `whisper-large-v3-turbo` (default) or `whisper-large-v3` for higher accuracy. |
+| `--llm-model` / `--tts-model` / `--voice` | Model and voice selection (voices: `autumn`, `diana`, `hannah`, `austin`, `daniel`, `troy`). |
+| `--timing` | Print a per-stage latency breakdown (STT/translate/TTS) to stderr. |
 
 ## Notes & limits
 
 - **Latency** is utterance-based: it waits for a pause (or your key release),
-  then runs speech-to-text → translate → speech. Playback starts on the first
-  audio chunk rather than after the whole clip is synthesised, which takes a
-  noticeable bite out of the wait. Still not word-by-word simultaneous
-  interpretation.
+  then runs speech-to-text → translate → speech. Groq's inference is fast
+  (sub-second STT and translate are typical), but its TTS endpoint returns one
+  complete audio file per utterance rather than streaming it as it's
+  generated, so playback starts after the whole clip downloads, not mid-clip.
+  Still not word-by-word simultaneous interpretation.
 - **Self-hearing:** the mic is muted for the duration of playback and its
   buffer flushed afterwards, so the translator never re-translates its own
   voice. Closed earpieces (including the aid) avoid acoustic leakage too.
 - **Quitting mid-sentence:** ESC finishes the translation already in flight
   instead of dropping it. Ctrl-C stops immediately.
-- **Cost:** roughly a few cents per active minute.
+- **Cost:** Groq has a free tier generous enough for personal use (per-model
+  daily request/audio-second limits at [console.groq.com/docs/rate-limits](https://console.groq.com/docs/rate-limits));
+  no credit card required to sign up.
 - **Privacy:** audio leaves your machine. See below to avoid that.
 
 ## Going fully offline / private
