@@ -1,0 +1,211 @@
+:root {
+  --bg: #f5f5f7;
+  --surface: #ffffff;
+  --surface-2: #eceef1;
+  --text: #1a1a1e;
+  --text-dim: #6b6f76;
+  --border: #e2e4e8;
+  --accent: #3b6fed;
+  --accent-text: #ffffff;
+  --heard-bubble: #eceef1;
+  --translated-bubble: #dde8ff;
+  --danger: #d64545;
+  --mic-idle: #3b6fed;
+  --mic-recording: #d64545;
+  --mic-processing: #b48a1f;
+  --mic-speaking: #2a9d5c;
+  --shadow: 0 2px 10px rgba(20, 20, 30, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131417;
+    --surface: #1c1e22;
+    --surface-2: #26282e;
+    --text: #f0f0f2;
+    --text-dim: #9a9ea6;
+    --border: #2e3138;
+    --accent: #6d93ff;
+    --accent-text: #0d1220;
+    --heard-bubble: #26282e;
+    --translated-bubble: #223258;
+    --danger: #ef6a6a;
+    --mic-idle: #6d93ff;
+    --mic-recording: #ef6a6a;
+    --mic-processing: #d8ab4a;
+    --mic-speaking: #4fc27f;
+    --shadow: 0 2px 14px rgba(0, 0, 0, 0.35);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+header h1 {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+select {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+  max-width: 30vw;
+}
+
+main {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.empty-state {
+  margin: auto;
+  text-align: center;
+  color: var(--text-dim);
+  max-width: 280px;
+  line-height: 1.5;
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(560px, 88%);
+}
+
+.bubble {
+  padding: 10px 14px;
+  border-radius: 16px;
+  line-height: 1.4;
+  font-size: 15px;
+  word-wrap: break-word;
+}
+
+.bubble.heard {
+  background: var(--heard-bubble);
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+}
+
+.bubble.translated {
+  background: var(--translated-bubble);
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+  font-weight: 500;
+}
+
+.bubble-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+
+footer {
+  flex-shrink: 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.status {
+  font-size: 13px;
+  color: var(--text-dim);
+  min-height: 16px;
+  text-align: center;
+}
+
+.status.error { color: var(--danger); }
+
+#talk-btn {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  border: none;
+  background: var(--mic-idle);
+  color: var(--accent-text);
+  box-shadow: var(--shadow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 0.15s ease, transform 0.1s ease;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+  user-select: none;
+}
+
+#talk-btn:active,
+#talk-btn.recording {
+  background: var(--mic-recording);
+  transform: scale(1.05);
+}
+
+#talk-btn.processing {
+  background: var(--mic-processing);
+}
+
+#talk-btn.speaking {
+  background: var(--mic-speaking);
+}
+
+#talk-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+#talk-btn svg {
+  width: 32px;
+  height: 32px;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--text-dim);
+}

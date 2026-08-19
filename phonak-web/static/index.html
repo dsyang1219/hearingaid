@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Phonak Translator</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Phonak Translator</h1>
+    <div class="controls">
+      <select id="target-select" title="Language you want to hear"></select>
+      <select id="voice-select" title="Voice"></select>
+    </div>
+  </header>
+
+  <main id="transcript">
+    <p class="empty-state">Hold the button below and speak. Release to translate.</p>
+  </main>
+
+  <footer>
+    <div class="status" id="status"></div>
+    <button id="talk-btn" aria-label="Hold to talk">
+      <svg viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/>
+        <path d="M19 11a1 1 0 0 0-2 0 5 5 0 0 1-10 0 1 1 0 0 0-2 0 7 7 0 0 0 6 6.92V20H9a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2h-2v-2.08A7 7 0 0 0 19 11z"/>
+      </svg>
+    </button>
+    <div class="hint">Hold to talk &middot; release to translate</div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
