@@ -78,6 +78,20 @@ CONTEXT_TURNS = 4           # prior exchanges given to the translator
 
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit mono
 
+# Whisper (trained heavily on YouTube captions) reliably hallucinates these
+# stock sign-off phrases when fed near-silent or noisy audio instead of
+# transcribing nothing -- a well-documented Whisper failure mode. If a "heard"
+# transcript is *exactly* one of these (ignoring case/punctuation), it's far
+# more likely mic noise than something someone actually said, so drop it
+# rather than translate and speak it. Trade-off: a genuine "Thank you." or
+# "Bye." gets dropped too.
+HALLUCINATION_PHRASES = frozenset({
+    "thank you", "thank you very much", "thanks for watching",
+    "thank you for watching", "thanks for watching!",
+    "please subscribe", "subscribe to my channel",
+    "bye", "bye bye", "goodbye", "see you next time",
+})
+
 SYSTEM_PROMPT = (
     "You are a live interpreter for someone wearing a hearing aid. Translate "
     "each user message into {target}. Earlier turns are provided for context -- "
@@ -88,6 +102,11 @@ SYSTEM_PROMPT = (
     "the register and the length of the original, because it is read aloud "
     "immediately."
 )
+
+
+def _is_hallucination(text: str) -> bool:
+    normalized = text.strip().lower().strip(".!?")
+    return normalized in HALLUCINATION_PHRASES
 
 
 # ----------------------------------------------------------------------------
@@ -440,7 +459,7 @@ def make_handler(engine: Translator, speaker: Speaker, mic: Microphone,
         except Exception as exc:
             print(f"[speech-to-text error] {exc}", file=sys.stderr)
             return
-        if not heard:
+        if not heard or _is_hallucination(heard):
             return
         print(f"  heard: {heard}")
         t1 = time.monotonic()
